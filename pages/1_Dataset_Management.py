@@ -87,19 +87,37 @@ if selected_dataset and selected_dataset != "No datasets available":
         num_burst = st.number_input("Burst Shots amount (multiple at once)", min_value=1, max_value=20, value=5)
     
     # Standard single Streamlit picture
-    camera_image = st.camera_input("Take a standard single picture")
-    if camera_image:
-        file_path = os.path.join(dataset_path, f"{base_name}_{int(time.time())}.jpg")
-        with open(file_path, "wb") as f:
-            f.write(camera_image.getbuffer())
-        st.success(f"Image saved as '{os.path.basename(file_path)}'!")
-        logger.info(f"Saved camera capture '{file_path}'")
+    if "show_single_cam" not in st.session_state:
+        st.session_state.show_single_cam = False
+        
+    cam_col1, cam_col2 = st.columns(2)
+    with cam_col1:
+        if st.button("Start Camera", use_container_width=True):
+            st.session_state.show_single_cam = True
+    with cam_col2:
+        if st.button("Stop Camera", use_container_width=True):
+            st.session_state.show_single_cam = False
+            
+    if st.session_state.show_single_cam:
+        camera_image = st.camera_input("Take a standard single picture")
+        if camera_image:
+            file_path = os.path.join(dataset_path, f"{base_name}_{int(time.time())}.jpg")
+            with open(file_path, "wb") as f:
+                f.write(camera_image.getbuffer())
+            st.success(f"Image saved as '{os.path.basename(file_path)}'!")
+            logger.info(f"Saved camera capture '{file_path}'")
         
     # Burst shots via backend OpenCV
     if st.button(f"Take {num_burst} Burst Shots via Local Camera"):
-        cap = cv2.VideoCapture(0)
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        if cap.isOpened():
+            # Set resolution explicitly to avoid distorted/zebra feed
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            
         if not cap.isOpened():
-            st.error("Error: Could not open local webcam for burst.")
+            st.error("Error: Could not open local webcam for burst. Is another tab using it?")
+
         else:
             with st.spinner(f"Taking {num_burst} shots quickly... Please look at the camera!"):
                 for i in range(num_burst):

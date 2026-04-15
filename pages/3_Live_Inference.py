@@ -33,6 +33,42 @@ if os.path.exists(DATASETS_DIR):
         if os.path.isdir(os.path.join(DATASETS_DIR, d)):
             existing_datasets.append(d)
 
+@st.cache_data(show_spinner=False)
+def get_dataset_embeddings(dataset_name, _mtcnn_dataset, _resnet, _device):
+    """Computes and caches embeddings for the selected dataset."""
+    embeddings = {}
+    datasets_to_load = []
+    
+    if dataset_name == "All Datasets":
+        if os.path.exists(DATASETS_DIR):
+            datasets_to_load = [os.path.join(DATASETS_DIR, d, "images") for d in os.listdir(DATASETS_DIR) if os.path.isdir(os.path.join(DATASETS_DIR, d))]
+    else:
+        datasets_to_load = [os.path.join(DATASETS_DIR, dataset_name, "images")]
+
+    for dataset_path in datasets_to_load:
+        if os.path.exists(dataset_path):
+            curr_dataset_name = os.path.basename(os.path.dirname(dataset_path))
+            for img_name in os.listdir(dataset_path):
+                if img_name.lower().endswith(('jpg', 'jpeg', 'png')):
+                    img_path = os.path.join(dataset_path, img_name)
+                    try:
+                        img_pil = Image.open(img_path).convert("RGB")
+                        face_tensor = _mtcnn_dataset(img_pil)
+                        if face_tensor is not None:
+                            emb = _resnet(face_tensor.unsqueeze(0).to(_device)).detach()
+                            base_name = img_name.replace('.jpg', '').replace('.jpeg', '').replace('.png', '')
+                            if "_face_" in base_name:
+                                base_name = base_name.split("_face_")[0]
+                            elif "_burst_" in base_name:
+                                base_name = base_name.split("_burst_")[0]
+                            else:
+                                base_name = base_name.split("_burst")[0].split("_")[0]
+
+                            embeddings[img_name] = {"emb": emb, "name": base_name, "dataset": curr_dataset_name}
+                    except:
+                        pass
+    return embeddings
+
 col1, col2 = st.columns([1, 3])
 
 with col1:
@@ -42,9 +78,9 @@ with col1:
     
     col_start, col_stop = st.columns(2)
     with col_start:
-        start_cam = st.button("Start Camera", use_container_width=True)
+        start_cam = st.button("Start Camera")
     with col_stop:
-        stop_cam = st.button("Stop Camera", use_container_width=True)
+        stop_cam = st.button("Stop Camera")
         
     if "run_camera" not in st.session_state:
         st.session_state.run_camera = False
@@ -66,55 +102,55 @@ with col2:
 
 dataset_embeddings = {}
 if run_camera:
-    datasets_to_load = []
-    if selected_dataset == "All Datasets":
-        if os.path.exists(DATASETS_DIR):
-            datasets_to_load = [os.path.join(DATASETS_DIR, d, "images") for d in os.listdir(DATASETS_DIR) if os.path.isdir(os.path.join(DATASETS_DIR, d))]
-    else:
-        datasets_to_load = [os.path.join(DATASETS_DIR, selected_dataset, "images")]
-
-    for dataset_path in datasets_to_load:
-        if os.path.exists(dataset_path):
-            dataset_name = os.path.basename(os.path.dirname(dataset_path))
-            with st.spinner(f"Indexing faces from {dataset_name} dataset..."):
-                for img_name in os.listdir(dataset_path):
-                    if img_name.lower().endswith(('jpg', 'jpeg', 'png')):
-                        img_path = os.path.join(dataset_path, img_name)
-                        try:
-                            img_pil = Image.open(img_path).convert("RGB")
-                            face_tensor = mtcnn_dataset(img_pil)
-                            if face_tensor is not None:
-                                emb = resnet(face_tensor.unsqueeze(0).to(device)).detach()
-                                # Keep base name logic mapping
-                                base_name = img_name.replace('.jpg', '').replace('.jpeg', '').replace('.png', '')
-                                if "_face_" in base_name:
-                                    base_name = base_name.split("_face_")[0]
-                                elif "_burst_" in base_name:
-                                    base_name = base_name.split("_burst_")[0]
-                                else:
-                                    base_name = base_name.split("_burst")[0].split("_")[0]
-
-                                dataset_embeddings[img_name] = {"emb": emb, "name": base_name, "dataset": dataset_name}
-                        except Exception as e:
-                            pass
+    with st.spinner(f"Loading and indexing '{selected_dataset}'..."):
+        dataset_embeddings = get_dataset_embeddings(selected_dataset, mtcnn_dataset, resnet, device)
 
 if run_camera:
     cap = None
     try:
-        cap = cv2.VideoCapture(0)
+        # Preferred backend on Windows
+        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+        
+        # Fallback if DirectShow fails
         if not cap.isOpened():
-            st.error("Error: Could not open the specified webcam feed.")
+            cap = cv2.VideoCapture(0)
+
+        if cap.isOpened():
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+            # Short sleep to allow the camera sensor to activate
+            time.sleep(0.5)
+            # Clear initial black buffer frames
+            for _ in range(5):
+                cap.read()
+        
+        if not cap.isOpened():
+            st.error("Error: Could not open the specified webcam. Check if another app or browser tab is locking it.")
             st.session_state.run_camera = False
         else:
             st.success("Face Scanning is Active... Click 'Stop Camera' to end.")
+
             logger.info("Started live FaceNet inference.")
             
             last_log_time = 0
             log_messages = []
             
+            # Create a localized status for the loop
+            feed_status = st.empty()
+            
             while st.session_state.run_camera:
                 ret, frame = cap.read()
-                if not ret: break
+                if not ret:
+                    feed_status.error("Lost camera connection or failed to read frame. Please try stopping and starting the camera again.")
+                    break
+                
+                # Check for completely black/empty frames
+                if frame is None or np.sum(frame) == 0:
+                    feed_status.warning("Camera is returning empty/black frames. Check your hardware connection.")
+                    continue
+                else:
+                    feed_status.empty() # Clear warning if we get a real frame
+
                 
                 frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 frame_pil = Image.fromarray(frame_rgb)
