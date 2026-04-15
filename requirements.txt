@@ -7,4 +7,5 @@ Pillow>=10.0.0
 torch
 torchvision
 facenet-pytorch
+streamlit-webrtc
 

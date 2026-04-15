@@ -1,37 +1,36 @@
 import streamlit as st
 import cv2
 import os
-import time
 import torch
 import torch.nn.functional as F
 import numpy as np
 from PIL import Image
 from facenet_pytorch import MTCNN, InceptionResnetV1
 from utils.logger import logger
+from streamlit_webrtc import webrtc_streamer, VideoTransformerBase, RTCConfiguration, WebRtcMode
 
-st.set_page_config(page_title="Face Identification", page_icon="👤", layout="wide")
+# Page Config
+st.set_page_config(page_title="Cloud Face ID", page_icon="👤", layout="wide")
 
-st.title("👤 Live Video Face Identification")
-st.markdown("Real-time **Face Detection and Recognition**. The model maps human faces and cross-references them against your uploaded dataset.")
+st.title("👤 Online Live Face Identification")
+st.markdown("This version uses **WebRTC** to stream your local camera safely to the cloud server.")
 
 DATASETS_DIR = "datasets"
+
+# STUN Servers for reliable connection on Cloud
+RTC_CONFIGURATION = RTCConfiguration(
+    {"iceServers": [{"urls": ["stun:stun.l.google.com:19302", "stun:stun1.l.google.com:19302"]}]}
+)
 
 @st.cache_resource
 def load_face_models():
     """Loads FaceNet MTCNN for detection and InceptionResnetV1 for recognition."""
     device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
     mtcnn_detector = MTCNN(keep_all=True, device=device)
-    mtcnn_extractor = MTCNN(keep_all=False, device=device)
     resnet = InceptionResnetV1(pretrained='vggface2').eval().to(device)
-    return mtcnn_detector, mtcnn_extractor, resnet, device
+    return mtcnn_detector, resnet, device
 
-mtcnn, mtcnn_dataset, resnet, device = load_face_models()
-
-existing_datasets = ["All Datasets"]
-if os.path.exists(DATASETS_DIR):
-    for d in os.listdir(DATASETS_DIR):
-        if os.path.isdir(os.path.join(DATASETS_DIR, d)):
-            existing_datasets.append(d)
+mtcnn, resnet, device = load_face_models()
 
 @st.cache_data(show_spinner=False)
 def get_dataset_embeddings(dataset_name, _mtcnn_dataset, _resnet, _device):
@@ -53,9 +52,11 @@ def get_dataset_embeddings(dataset_name, _mtcnn_dataset, _resnet, _device):
                     img_path = os.path.join(dataset_path, img_name)
                     try:
                         img_pil = Image.open(img_path).convert("RGB")
+                        # Use a smaller version for quick indexing
                         face_tensor = _mtcnn_dataset(img_pil)
                         if face_tensor is not None:
-                            emb = _resnet(face_tensor.unsqueeze(0).to(_device)).detach()
+                            # We take the first face detected for indexing
+                            emb = _resnet(face_tensor[0].unsqueeze(0).to(_device)).detach()
                             base_name = img_name.replace('.jpg', '').replace('.jpeg', '').replace('.png', '')
                             if "_face_" in base_name:
                                 base_name = base_name.split("_face_")[0]
@@ -69,6 +70,67 @@ def get_dataset_embeddings(dataset_name, _mtcnn_dataset, _resnet, _device):
                         pass
     return embeddings
 
+class FaceIDTransformer(VideoTransformerBase):
+    def __init__(self, mtcnn, resnet, device, embeddings, threshold):
+        self.mtcnn = mtcnn
+        self.resnet = resnet
+        self.device = device
+        self.embeddings = embeddings
+        self.threshold = threshold
+
+    def transform(self, frame):
+        img = frame.to_ndarray(format="bgr24")
+        
+        # Convert to RGB for MTCNN
+        img_rgb = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+        img_pil = Image.fromarray(img_rgb)
+        
+        # Detect faces
+        boxes, probs = self.mtcnn.detect(img_pil)
+        
+        if boxes is not None:
+            # Re-extract for embeddings
+            faces_tensor = self.mtcnn.extract(img_pil, boxes, save_path=None)
+            if faces_tensor is not None:
+                face_embeddings = self.resnet(faces_tensor.to(self.device)).detach()
+                
+                for i in range(len(boxes)):
+                    box, prob, emb = boxes[i], probs[i], face_embeddings[i]
+                    if prob is None or prob < 0.90: continue
+                        
+                    x1, y1, x2, y2 = map(int, box)
+                    label, color = "Unknown", (0, 165, 255)
+                    
+                    if self.embeddings:
+                        best_sim, best_match_name = -1.0, None
+                        
+                        for fname, data in self.embeddings.items():
+                            sim = F.cosine_similarity(emb.unsqueeze(0), data["emb"]).item()
+                            if sim > best_sim:
+                                best_sim = sim
+                                best_match_name = data["name"]
+                        
+                        if best_sim >= self.threshold:
+                            label = f"{best_match_name} ({best_sim:.2f})"
+                            color = (0, 255, 0)
+                        else:
+                            label = f"Unknown ({best_sim:.2f})"
+                            
+                    # Draw on frame
+                    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+                    (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
+                    cv2.rectangle(img, (x1, y1 - th - 5), (x1 + tw, y1), color, -1)
+                    cv2.putText(img, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
+        
+        return img
+
+# --- UI Setup ---
+existing_datasets = ["All Datasets"]
+if os.path.exists(DATASETS_DIR):
+    for d in os.listdir(DATASETS_DIR):
+        if os.path.isdir(os.path.join(DATASETS_DIR, d)):
+            existing_datasets.append(d)
+
 col1, col2 = st.columns([1, 3])
 
 with col1:
@@ -76,144 +138,19 @@ with col1:
     selected_dataset = st.selectbox("Select Face Dataset to Match Against", existing_datasets)
     sim_threshold = st.slider("Similarity Threshold", 0.0, 1.0, 0.65, 0.05)
     
-    col_start, col_stop = st.columns(2)
-    with col_start:
-        start_cam = st.button("Start Camera")
-    with col_stop:
-        stop_cam = st.button("Stop Camera")
-        
-    if "run_camera" not in st.session_state:
-        st.session_state.run_camera = False
-        
-    if start_cam:
-        st.session_state.run_camera = True
-    if stop_cam:
-        st.session_state.run_camera = False
-        
-    run_camera = st.session_state.run_camera
+    # Pre-index based on selection
+    with st.spinner(f"Indexing '{selected_dataset}'..."):
+        dataset_embeddings = get_dataset_embeddings(selected_dataset, mtcnn, resnet, device)
     
-    st.markdown("---")
-    st.subheader("Live Activity Log")
-    log_placeholder = st.empty()
+    st.success(f"Indexed {len(dataset_embeddings)} face patterns.")
+    st.info("The Activity Log is disabled in WebRTC mode to ensure smooth performance.")
 
 with col2:
-    st.subheader("Live Feed")
-    feed_placeholder = st.empty()
-
-dataset_embeddings = {}
-if run_camera:
-    with st.spinner(f"Loading and indexing '{selected_dataset}'..."):
-        dataset_embeddings = get_dataset_embeddings(selected_dataset, mtcnn_dataset, resnet, device)
-
-if run_camera:
-    cap = None
-    try:
-        # Preferred backend on Windows
-        cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
-        
-        # Fallback if DirectShow fails
-        if not cap.isOpened():
-            cap = cv2.VideoCapture(0)
-
-        if cap.isOpened():
-            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-            # Short sleep to allow the camera sensor to activate
-            time.sleep(0.5)
-            # Clear initial black buffer frames
-            for _ in range(5):
-                cap.read()
-        
-        if not cap.isOpened():
-            st.error("Error: Could not open the specified webcam. Check if another app or browser tab is locking it.")
-            st.session_state.run_camera = False
-        else:
-            st.success("Face Scanning is Active... Click 'Stop Camera' to end.")
-
-            logger.info("Started live FaceNet inference.")
-            
-            last_log_time = 0
-            log_messages = []
-            
-            # Create a localized status for the loop
-            feed_status = st.empty()
-            
-            while st.session_state.run_camera:
-                ret, frame = cap.read()
-                if not ret:
-                    feed_status.error("Lost camera connection or failed to read frame. Please try stopping and starting the camera again.")
-                    break
-                
-                # Check for completely black/empty frames
-                if frame is None or np.sum(frame) == 0:
-                    feed_status.warning("Camera is returning empty/black frames. Check your hardware connection.")
-                    continue
-                else:
-                    feed_status.empty() # Clear warning if we get a real frame
-
-                
-                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                frame_pil = Image.fromarray(frame_rgb)
-                
-                boxes, probs = mtcnn.detect(frame_pil)
-                if boxes is not None:
-                    faces_tensor = mtcnn.extract(frame_pil, boxes, save_path=None)
-                    if faces_tensor is not None:
-                        embeddings = resnet(faces_tensor.to(device)).detach()
-                        
-                        for i in range(len(boxes)):
-                            box, prob, emb = boxes[i], probs[i], embeddings[i]
-                            if prob is None or prob < 0.90: continue
-                                
-                            x1, y1, x2, y2 = map(int, box)
-                            label, color = "Unknown Face", (0, 165, 255)
-                            
-                            if dataset_embeddings:
-                                best_sim, best_match_name, best_match_dataset = -1.0, None, None
-                                
-                                for fname, data in dataset_embeddings.items():
-                                    sim = F.cosine_similarity(emb.unsqueeze(0), data["emb"]).item()
-                                    if sim > best_sim:
-                                        best_sim = sim
-                                        best_match_name = data["name"]
-                                        best_match_dataset = data.get("dataset", "Unknown Dataset")
-                                
-                                # Throttled Logging to prevent flooding
-                                current_time = time.time()
-                                if best_sim >= sim_threshold:
-                                    label = f"{best_match_name} ({best_sim:.2f})"
-                                    color = (0, 255, 0)
-                                    if current_time - last_log_time > 2.0:
-                                        msg = f"✅ MATCH: Detect '{best_match_name}' from dataset '{best_match_dataset}' correctly (sim: {best_sim:.2f})"
-                                        logger.info(msg)
-                                        log_messages.insert(0, msg)
-                                        last_log_time = current_time
-                                else:
-                                    label = f"Unknown ({best_sim:.2f})"
-                                    if current_time - last_log_time > 3.0:
-                                        msg = f"❌ UNVERIFIED: Detected face. Best guess '{best_match_name}' from '{best_match_dataset}' but sim too low ({best_sim:.2f})"
-                                        logger.info(msg)
-                                        log_messages.insert(0, msg)
-                                        last_log_time = current_time
-                                        
-                            cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                            (tw, th), _ = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.6, 2)
-                            cv2.rectangle(frame, (x1, y1 - th - 5), (x1 + tw, y1), color, -1)
-                            cv2.putText(frame, label, (x1, y1 - 5), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 255), 2)
-                
-                annotated_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-                feed_placeholder.image(annotated_frame, channels="RGB")
-                
-                # Update UI Log
-                if log_messages:
-                    log_placeholder.markdown("\n".join([f"- {m}" for m in log_messages[:5]]))
-                
-    except Exception as e:
-        if type(e).__name__ != 'RerunException' and type(e).__name__ != 'StopException':
-            logger.error(f"Inference error: {e}")
-            st.error(f"An error occurred during inference: {e}")
-    finally:
-        if cap is not None:
-            cap.release()
-else:
-    st.info("System stand-by. Click 'Start Camera' above to launch detection.")
+    st.subheader("WebRTC Live Feed")
+    webrtc_streamer(
+        key="face-id",
+        mode=WebRtcMode.SENDRECV,
+        rtc_configuration=RTC_CONFIGURATION,
+        video_processor_factory=lambda: FaceIDTransformer(mtcnn, resnet, device, dataset_embeddings, sim_threshold),
+        async_processing=True,
+    )
