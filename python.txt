@@ -1,1 +1,0 @@
-Based on your local env virtual environment configuration, this application is currently using Python 3.10.2.
